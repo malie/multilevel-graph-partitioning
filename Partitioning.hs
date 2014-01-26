@@ -11,6 +11,9 @@ import qualified System.Random as R
 
 import Control.Monad ( replicateM , liftM )
 
+import System.Process ( system )
+
+
 data Node n
          = Node n
          | CoarseNode Int
@@ -201,8 +204,13 @@ coarsenGraph g es = L.foldl' coarsen g xes
                           , S.member k ra
                           , let ebw = edgeWeight g M.! eb 
                           , let eaw = o M.! k ] 
-          
-partition :: (Ord e, Ord n, Show e, Show n, PartitioningGoal pg) => 
+
+
+type Clusters n = M.Map (Node n) Int
+
+
+partition :: (Ord e, Ord n, Show e, Show n
+             , PartitioningGoal pg) =>
              Graph n e -> Int -> pg -> IO (Clusters n)
 partition g numClusters pg
   | numNodes g < 3*numClusters = -- magic number '3' ...
@@ -229,8 +237,6 @@ tupleToList :: (a,a) -> [a]
 tupleToList (a,b) = [a,b]
   
 
-
-type Clusters n = M.Map (Node n) Int
 
 data Score = Score { cutEdges :: Double 
                    , imbalance :: Double 
@@ -379,3 +385,30 @@ testGraph2 =
             (500,600), 
             (600, 610), 
             (600, 100), (610,100)]
+
+-- | write a dot file
+writeDotFile :: (Show n) =>
+                String -> Graph n e -> Maybe (Clusters n) -> IO ()
+writeDotFile filename g maybeClusters =
+  writeFile filename $ concat $
+  [ "graph aGraph {\n" ]
+  ++ (case maybeClusters of
+         Nothing -> []
+         Just clusters ->
+           [ "  " ++ sq n
+             ++ "[style=filled, color=\"/"
+             ++ colorscheme ++ "/" ++ show (c+1) ++ "\"];\n"
+           | (n,c) <- M.toList clusters ])
+  ++ [ "  " ++ sq a ++ " -- " ++ sq b ++ ";\n"
+     | (a,b) <- M.elems $ edgeNodes g ]
+  ++ [ "}\n"]
+  where sq n = "\"" ++ show n ++ "\""
+        colorscheme = "rdylgn10"
+
+showGraph :: (Show n) => Graph n e -> Maybe (Clusters n) -> IO ()
+showGraph g cl =
+  do writeDotFile "last.gv" g cl
+     system "neato -Tsvg last.gv > last.svg"
+     system "emacsclient -n last.svg"
+     return ()
+
