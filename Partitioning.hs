@@ -9,7 +9,9 @@ import qualified Data.Set as S
 import qualified Data.Vector as V
 import qualified System.Random as R
 
-import Control.Monad ( replicateM , liftM )
+import Data.Ord ( comparing )
+
+import Control.Monad ( replicateM , liftM , when , foldM )
 
 import System.Process ( system )
 
@@ -95,6 +97,9 @@ randomInts count lower upper = replicateM count (randomInt lower upper)
 
 randomVectorElement :: V.Vector a -> IO a
 randomVectorElement v = liftM (v V.!) $ randomInt 0 (pred $ V.length v)
+
+randomDouble :: Double -> Double -> IO Double
+randomDouble lower upper = R.getStdRandom $ R.randomR (lower, upper)
 
 
 -- optimisation: multiple passes to use M.fromAscList and M.unions instead of M.fromList (??)
@@ -225,9 +230,8 @@ partition g numClusters pg
      return undefined
   
 
-nodeNeighbours :: (Ord e, Ord n) => Graph n e -> Node n -> V.Vector (Node n)
+nodeNeighbours :: (Ord e, Ord n) => Graph n e -> Node n -> [Node n]
 nodeNeighbours g n =
-  V.fromList
   [ neigbour
   | e <- S.toList $ nodeEdges g M.! n
   , neigbour <- tupleToList $ edgeNodes g M.! e
@@ -250,8 +254,9 @@ class PartitioningGoal a where
   scoreAssignment :: (Ord e, Ord n) =>
                      a -> Graph n e -> Clusters n -> Score
   scoreChange :: (Ord e, Ord n) =>
-                 a -> Graph n e -> Clusters n -> Node n -> Int -> Score -> Score
-  isBetterScore :: a -> Score -> Score -> Bool
+                 a -> Graph n e -> Clusters n -> Node n -> Int
+                 -> Score -> Score
+  compareScores :: a -> Score -> Score -> Ordering
     
 
 data MinimalCuts = MinimalCuts
@@ -289,10 +294,16 @@ instance PartitioningGoal MinimalCuts where
                           then 0.0
                           else edgeWeight g M.! e
       nw = nodeWeight g M.! node :: Double
-      weights2 = M.adjust (+nw) newCluster $ M.adjust (subtract nw) oldCluster weights1
+      weights2 = M.adjust (+nw) newCluster $
+                 M.adjust (subtract nw) oldCluster weights1
       clweight ws c = ((ws M.! c) - targetWeight) ** 2
-  isBetterScore _ (Score cex ibx _ _) (Score cey iby _ _) =
-    cey < cex || iby < ibx
+  compareScores _ (Score cex ibx _ _) (Score cey iby _ _) =
+    case (compare cex cey, compare ibx iby) of
+      (GT, _)  -> GT
+      --(LT, GT) -> EQ -- ???
+      (_, GT) -> GT
+      (EQ, EQ) -> EQ
+      (_, _)   -> LT
 
 
 data BalancedClusters = BalancedClusters
@@ -300,14 +311,44 @@ data BalancedClusters = BalancedClusters
 instance PartitioningGoal BalancedClusters where
   scoreAssignment _ g cl = undefined
   scoreChange _ g cl node newcluster sc = undefined
-  isBetterScore _ a b = undefined
-  
-        
+  compareScores _ a b = undefined
+
+
+-- | a random clustering to start up 'partitionSlow'
+randomAssignment :: (Ord n, Ord e, Show n) =>
+                    Graph n e -> Int -> IO (Clusters n)
+randomAssignment g numClusters =
+  do let es = V.fromList $ M.keys $ nodeEdges g
+     let len = V.length es
+     is0 <- randomInts len 0 (pred len)
+     let is = L.nub is0
+     grow $ M.fromList $ concat $
+       [ [(n, cl) ]
+       | cl <- [1 .. numClusters]
+       | i <- is
+       , let n = es V.! i]
+  where grow as =
+          do let m = concat
+                     [ if M.member a as && M.notMember b as
+                       then [(b, as M.! a)]
+                       else if M.member b as && M.notMember a as
+                            then [(a, as M.! b)]
+                            else []
+                     | (a,b) <- M.elems $ edgeNodes g ]
+             if null m
+               then return as
+               else grow $ M.union as $ M.fromList m
+-- maybe randomAssignment should first assign those nodes
+-- with largest weight, then extend via edges with largest weights
+
+
+
 -- | refine random cluster assignments by "local search".
-partitionSlow :: (Ord e, Ord n, Show e, Show n, PartitioningGoal pg) =>
+partitionSlow :: (Ord e, Ord n, Show e, Show n,
+                  PartitioningGoal pg) =>
                  Graph n e -> Int -> pg -> IO (Clusters n)
 partitionSlow g numClusters pg =
-  do as <- randomAssignment
+  do as <- randomAssignment g numClusters
      mapM_ print $ M.toList as
      let score0 = scoreAssignment pg g as
      print score0
@@ -317,37 +358,37 @@ partitionSlow g numClusters pg =
      let score2 = scoreAssignment pg g nas
      print score2
      return nas
-  where randomAssignment =
-          do cl <- randomInts (numNodes g) 0 (pred numClusters)
-             return $ M.fromList $ zip (M.keys $ nodeEdges g) cl
-        nodes = V.fromList $ M.keys $ nodeWeight g
+  where nodes = V.fromList $ M.keys $ nodeWeight g
         randomNode = randomVectorElement nodes
         localSearch 0 as sc = return (as, sc)
         localSearch i as sc1 =
           do n <- randomNode
              let neighbours = nodeNeighbours g n
-             rn <- randomVectorElement neighbours
-             let ncl = as M.! rn
-             if ncl == as M.! n -- assign same cluster, boring
+                 nclusters = S.fromList $ map (as M.!) neighbours
+                 options =
+                   [ (scoreChange pg g as n ncl sc1, as2)
+                   | ncl <- S.toList nclusters
+                   , let as2 = M.insert n ncl as
+                   -- avoid dropping last in cluster
+                   , S.size (S.fromList $ M.elems as2)
+                     == numClusters ]
+             if null options
                then localSearch (pred i) as sc1
-               else
-               do let newclustering = M.insert n ncl as
-                      numcl = S.size $ S.fromList $ M.elems newclustering
-                      sc2 = scoreChange pg g as n ncl sc1
-                  if numcl == numClusters  -- don't kill any cluster
-                     && isBetterScore pg sc1 sc2
-                    then do putStrLn $ show i ++ " improved from " ++ show sc1
-                              ++ " to " ++ show sc2
-                              ++ " by assigning " ++ show ncl ++ " to " ++ show n
-                            localSearch (pred i) newclustering sc2
-                    else localSearch (pred i) as sc1
-                                  
+               else ls i as n sc1 options
+        ls i as n sc1 options =
+          do mapM_ (\(sc, as)-> print(i, n, as M.! n, sc)) options
+             let cp a b = compareScores pg (fst a) (fst b)
+                 (bestSc, bestAs) = L.minimumBy cp options
+             when (compareScores pg sc1 bestSc == GT) $
+               putStrLn (show i ++ " improved "
+                         ++ show sc1 ++ " to " ++ show bestSc
+                         ++ " by assigning " ++ show (bestAs M.! n)
+                         ++ " to " ++ show n)
+
+             localSearch (pred i) bestAs bestSc
 
 -- actually all that partitioning stuff can
 -- be restarted at any level
-
--- dig out zipper supporting incremental updates??
--- really needed?
 
 
 
@@ -386,12 +427,64 @@ testGraph2 =
             (600, 610), 
             (600, 100), (610,100)]
 
+type ExampleGraph3 = Graph (Int,Int,Int) Int
+
+randomGraphFromRectangles :: Int -> Int -> Int -> Int
+                       -> IO ExampleGraph3
+randomGraphFromRectangles numRects width height numConnections =
+  do g <- rectangleNodes 0 empty
+     let es = rectangleEdges 0
+     ees <- replicateM numConnections extraEdge
+     foldM ae g (zip [1..] (es ++ ees))
+  where rectangleNodes :: Int -> ExampleGraph3 -> IO ExampleGraph3
+        rectangleNodes n g
+          | n == numRects = return g
+          | otherwise =
+            do g2 <- foldM (an n) g
+                     [ (x,y)
+                     | x <- [1..width]
+                     , y <- [1..height]]
+               rectangleNodes (succ n) g2
+        an n g (x,y) =
+          do w <- randomWeight
+             return $ addNodeWithWeight (Node (n,x,y)) w g
+        randomWeight =
+          do r <- randomDouble 1.0 10.0
+             return $ fromIntegral (round $ r*10) / 10
+        rectangleEdges n
+          | n == numRects = []
+          | otherwise =
+            [ ((n,u,v), (n,x,y))
+                 | u <- [1..width]
+                 , v <- [1..height]
+                 , (x,y) <- [(u+1, v), (u, v+1)]
+                 , x <= width
+                 , y <= height ]
+            ++ rectangleEdges (succ n) 
+        extraEdge =
+          do rect1 <- randomInt 0 (pred numRects)
+             u <- randomInt 1 width
+             v <- randomInt 1 height
+             rect2 <- randomInt 0 (pred numRects)
+             x <- randomInt 1 width
+             y <- randomInt 1 height
+             return ((rect1, u, v), (rect2, x, y))
+        ae g (egdeId, ((r,u,v),(rr,x,y))) =
+          do w <- randomWeight
+             return $ addEdgeWithWeight (Edge egdeId)
+               (Node (r,u,v)) (Node (rr,x,y)) w g
+
+
+
+
+
 -- | write a dot file
 writeDotFile :: (Show n) =>
                 String -> Graph n e -> Maybe (Clusters n) -> IO ()
 writeDotFile filename g maybeClusters =
   writeFile filename $ concat $
-  [ "graph aGraph {\n" ]
+  [ "graph aGraph {\n"
+  , "  edge[len=1.6]" ]
   ++ (case maybeClusters of
          Nothing -> []
          Just clusters ->
