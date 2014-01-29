@@ -89,6 +89,26 @@ addEdgeWithWeight e a b w g
       , numEdges = succ (numEdges g) }
   where inse edges = Just $ S.insert e edges
 
+
+
+
+checkGraph :: (Ord n, Ord e) => Graph n e -> IO ()
+checkGraph g =
+  do ck "set of edges in nodeEdges vs. edgeWeight"
+       (M.keysSet (edgeWeight g)
+        == S.unions (M.elems $ nodeEdges g))
+     ck "set of edges in edgeNodes vs. edgeWeight"
+       (M.keysSet (edgeWeight g) == M.keysSet (edgeNodes g))
+     ck "set of nodes in nodeEdges vs. edgeNodes"
+       (M.keysSet (nodeEdges g)
+        == S.unions [ S.fromList $ tupleToList t
+                    | t <- M.elems $ edgeNodes g])
+  where ck msg True = return ()
+        ck msg False = error msg
+
+
+
+
 randomInt :: Int -> Int -> IO Int
 randomInt lower upper = R.getStdRandom $ R.randomR (lower, upper)
 
@@ -127,7 +147,7 @@ coarsenGraph g es = L.foldl' coarsen g xes
      xes = [ (CoarseNode xid, ed)
            | xid <- [nextId g..]
            | ed@(e, (a,b)) <- M.toList es ]
-     nnextId = case last xes of (CoarseNode x,_) -> x
+     nnextId = case last xes of (CoarseNode x,_) -> x+1
      coarsen g (nn, (e, (a,b))) =
           Graph { nodeEdges = 
                      updateNodeEdges $ 
@@ -225,9 +245,11 @@ partition g numClusters pg
      putStrLn "coarsening edges:"
      mapM_ print $ M.toList es
      let cg = coarsenGraph g es
+     putStrLn "coarse graph:"
      printGraph cg
+     checkGraph cg
      cp <- partition cg numClusters pg
-     return undefined
+     return cp -- todo, expand clustering
   
 
 nodeNeighbours :: (Ord e, Ord n) => Graph n e -> Node n -> [Node n]
@@ -298,12 +320,11 @@ instance PartitioningGoal MinimalCuts where
                  M.adjust (subtract nw) oldCluster weights1
       clweight ws c = ((ws M.! c) - targetWeight) ** 2
   compareScores _ (Score cex ibx _ _) (Score cey iby _ _) =
-    case (compare cex cey, compare ibx iby) of
-      (GT, _)  -> GT
-      --(LT, GT) -> EQ -- ???
-      (_, GT) -> GT
-      (EQ, EQ) -> EQ
-      (_, _)   -> LT
+    case (compare cex cey, compare ibx iby, compare (cex+ibx) (cey+iby)) of
+      (GT, _, GT)  -> GT
+      (_, GT, GT)  -> GT
+      (EQ, EQ, _)  -> EQ
+      (_, _, _)    -> LT
 
 
 data BalancedClusters = BalancedClusters
@@ -449,7 +470,7 @@ randomGraphFromRectangles numRects width height numConnections =
           do w <- randomWeight
              return $ addNodeWithWeight (Node (n,x,y)) w g
         randomWeight =
-          do r <- randomDouble 1.0 10.0
+          do r <- randomDouble 4.0 5.0
              return $ fromIntegral (round $ r*10) / 10
         rectangleEdges n
           | n == numRects = []
@@ -504,4 +525,3 @@ showGraph g cl =
      system "neato -Tsvg last.gv > last.svg"
      system "emacsclient -n last.svg"
      return ()
-
