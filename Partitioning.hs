@@ -19,7 +19,7 @@ import System.Process ( system )
 data Node n
          = Node n
          | CoarseNode Int
-         deriving (Eq, Ord, Show)
+         deriving (Eq, Ord)
 
 data Edge e
          = Edge e
@@ -35,6 +35,12 @@ data Graph n e =
         , numEdges :: Int 
         , nextId :: Int } 
   deriving (Show)
+
+instance (Show n) => Show (Node n) where
+  show (Node n)       = show n
+  show (CoarseNode i) = "CoarseNode " ++ show i
+
+
 
 empty :: Graph n e
 empty =
@@ -141,12 +147,18 @@ randomSetOfEdgesNonOverlapping g =
                else do rest <- rec (S.insert b (S.insert a seen)) is
                        return $ ed : rest
                
-coarsenGraph :: (Ord n, Ord e) => Graph n e -> EdgeSubset n e -> Graph n e
-coarsenGraph g es = L.foldl' coarsen g xes
+type ExpanderMap n = M.Map (Node n) [Node n]
+
+coarsenGraph :: (Ord n, Ord e) => 
+                Graph n e -> EdgeSubset n e -> (Graph n e, ExpanderMap n)
+coarsenGraph g es = ( L.foldl' coarsen g xes
+                    , expanderMap )
   where 
      xes = [ (CoarseNode xid, ed)
            | xid <- [nextId g..]
            | ed@(e, (a,b)) <- M.toList es ]
+     expanderMap = M.fromList [ (cn, [a,b])
+                              | (cn, (_, (a,b))) <- xes]
      nnextId = case last xes of (CoarseNode x,_) -> x+1
      coarsen g (nn, (e, (a,b))) =
           Graph { nodeEdges = 
@@ -231,12 +243,23 @@ coarsenGraph g es = L.foldl' coarsen g xes
                           , let eaw = o M.! k ] 
 
 
+expandClustering :: (Ord n) => ExpanderMap n -> Clusters n -> Clusters n
+expandClustering exp clustering =
+  M.fromList $ concat [ if M.member n exp
+                        then [(no,cl) | no <- exp M.! n]
+                        else [(n,cl)]
+                      | (n,cl) <- M.toList clustering ]
+
+nodesInExpanderMap :: (Ord n) => ExpanderMap n -> [Node n]
+nodesInExpanderMap em =
+  S.toList $ S.fromList $ concat $ M.elems em
+
 type Clusters n = M.Map (Node n) Int
 
 
 partition :: (Ord e, Ord n, Show e, Show n
              , PartitioningGoal pg) =>
-             Graph n e -> Int -> pg -> IO (Clusters n)
+             Graph n e -> Int -> pg -> IO (Clusters n, Score)
 partition g numClusters pg
   | numNodes g < 3*numClusters = -- magic number '3' ...
     partitionSlow g numClusters pg
@@ -244,12 +267,17 @@ partition g numClusters pg
   do es <- randomSetOfEdgesNonOverlapping g
      putStrLn "coarsening edges:"
      mapM_ print $ M.toList es
-     let cg = coarsenGraph g es
+     let (cg, exp) = coarsenGraph g es
      putStrLn "coarse graph:"
      printGraph cg
      checkGraph cg
-     cp <- partition cg numClusters pg
-     return cp -- todo, expand clustering
+     (cl, score1) <- partition cg numClusters pg
+     let ecl = expandClustering exp cl
+         en = V.fromList $ nodesInExpanderMap exp
+     (recl, score2) <- localSearch g pg en numClusters (5*V.length en) ecl score1
+     putStrLn ("refinement improved score from " ++ show score1 
+               ++ " to " ++ show score2)
+     return (recl, score2)
   
 
 nodeNeighbours :: (Ord e, Ord n) => Graph n e -> Node n -> [Node n]
@@ -289,7 +317,7 @@ instance PartitioningGoal MinimalCuts where
       ce = sum [ edgeWeight g M.! e
                | (e, (a, b)) <- M.toList $ edgeNodes g
                , cl M.! a /= cl M.! b ]
-      ib = sum [ (x - avg) ** 2 | x <- sizes ]
+      ib = sum [ abs (x - avg) ** 1 | x <- sizes ]
       sizes = map snd $ M.toList $ 
               M.fromListWith (+)
               [ (x, nodeWeight g M.! node)
@@ -318,13 +346,17 @@ instance PartitioningGoal MinimalCuts where
       nw = nodeWeight g M.! node :: Double
       weights2 = M.adjust (+nw) newCluster $
                  M.adjust (subtract nw) oldCluster weights1
-      clweight ws c = ((ws M.! c) - targetWeight) ** 2
+      clweight ws c = abs ((ws M.! c) - targetWeight) ** 1
   compareScores _ (Score cex ibx _ _) (Score cey iby _ _) =
+    compare (cex + ibx*ibx/70) (cey + iby*iby/70)
+    {-
     case (compare cex cey, compare ibx iby, compare (cex+ibx) (cey+iby)) of
-      (GT, _, GT)  -> GT
-      (_, GT, GT)  -> GT
+      -- (GT, _, GT)  -> GT
+      -- (_, GT, GT)  -> GT
+      (GT, _, _)  -> GT
+      (_, GT, _)  -> GT
       (EQ, EQ, _)  -> EQ
-      (_, _, _)    -> LT
+      (_, _, _)    -> LT-}
 
 
 data BalancedClusters = BalancedClusters
@@ -367,46 +399,56 @@ randomAssignment g numClusters =
 -- | refine random cluster assignments by "local search".
 partitionSlow :: (Ord e, Ord n, Show e, Show n,
                   PartitioningGoal pg) =>
-                 Graph n e -> Int -> pg -> IO (Clusters n)
+                 Graph n e -> Int -> pg -> IO (Clusters n, Score)
 partitionSlow g numClusters pg =
   do as <- randomAssignment g numClusters
      mapM_ print $ M.toList as
      let score0 = scoreAssignment pg g as
      print score0
-     (nas, score1) <- localSearch (5*numNodes g) as score0
+     (nas, score1) <- localSearch g pg nodesVector numClusters (5*numNodes g) as score0
      print score1
      putStr "recalculated: "
      let score2 = scoreAssignment pg g nas
      print score2
-     return nas
-  where nodes = V.fromList $ M.keys $ nodeWeight g
-        randomNode = randomVectorElement nodes
-        localSearch 0 as sc = return (as, sc)
-        localSearch i as sc1 =
-          do n <- randomNode
-             let neighbours = nodeNeighbours g n
-                 nclusters = S.fromList $ map (as M.!) neighbours
-                 options =
-                   [ (scoreChange pg g as n ncl sc1, as2)
-                   | ncl <- S.toList nclusters
-                   , let as2 = M.insert n ncl as
-                   -- avoid dropping last in cluster
-                   , S.size (S.fromList $ M.elems as2)
-                     == numClusters ]
-             if null options
-               then localSearch (pred i) as sc1
-               else ls i as n sc1 options
-        ls i as n sc1 options =
-          do mapM_ (\(sc, as)-> print(i, n, as M.! n, sc)) options
-             let cp a b = compareScores pg (fst a) (fst b)
-                 (bestSc, bestAs) = L.minimumBy cp options
-             when (compareScores pg sc1 bestSc == GT) $
-               putStrLn (show i ++ " improved "
-                         ++ show sc1 ++ " to " ++ show bestSc
-                         ++ " by assigning " ++ show (bestAs M.! n)
-                         ++ " to " ++ show n)
+     return (nas, score2)
+  where nodesVector = V.fromList $ M.keys $ nodeWeight g
 
-             localSearch (pred i) bestAs bestSc
+        
+localSearch :: (Ord n, Ord e, PartitioningGoal pg, Show n) =>
+               Graph n e -> pg -> V.Vector (Node n) -> Int
+               -> Int -> Clusters n -> Score -> IO (Clusters n, Score)
+localSearch g pg nodesVector numClusters = recN
+  where
+    recN n as sc =
+      do tries <- sequence [ rec n as sc
+                           | i <- [1..4] ]
+         return $ L.minimumBy (comparing $ cutEdges . snd) tries
+    rec 0 as sc = return (as, sc)
+    rec i as sc1 =
+      do n <- randomVectorElement nodesVector
+         let neighbours = nodeNeighbours g n
+             nclusters = S.fromList $ map (as M.!) neighbours
+             options =
+               [ (scoreChange pg g as n ncl sc1, as2)
+               | ncl <- S.toList nclusters
+               , let as2 = M.insert n ncl as
+               -- avoid dropping last in cluster
+               , S.size (S.fromList $ M.elems as2)
+                 == numClusters ]
+         if null options
+           then rec (pred i) as sc1
+           else ls i as n sc1 options
+    ls i as n sc1 options =
+      do -- mapM_ (\(sc, as)-> print(i, n, as M.! n, sc)) options
+         let cp a b = compareScores pg (fst a) (fst b)
+             (bestSc, bestAs) = L.minimumBy cp options
+         when (compareScores pg sc1 bestSc == GT) $
+           putStrLn (show i ++ " improved "
+                     ++ show sc1 ++ " to " ++ show bestSc
+                     ++ " by assigning " ++ show (bestAs M.! n)
+                     ++ " to " ++ show n)
+         rec (pred i) bestAs bestSc
+
 
 -- actually all that partitioning stuff can
 -- be restarted at any level
@@ -447,6 +489,9 @@ testGraph2 =
             (500,600), 
             (600, 610), 
             (600, 100), (610,100)]
+
+setSeed :: Int -> IO ()
+setSeed seed = R.setStdGen $ R.mkStdGen seed
 
 type ExampleGraph3 = Graph (Int,Int,Int) Int
 
@@ -525,3 +570,15 @@ showGraph g cl =
      system "neato -Tsvg last.gv > last.svg"
      system "emacsclient -n last.svg"
      return ()
+
+
+{-
+
+setSeed 1002
+g <- randomGraphFromRectangles 1 14 14 0
+--showGraph g Nothing
+system "mv last.svg graph-1.svg"
+(cl, score) <- partition g 10 MinimalCuts
+showGraph g (Just cl)
+
+-}
