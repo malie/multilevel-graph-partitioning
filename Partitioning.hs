@@ -146,7 +146,7 @@ randomSetOfEdgesNonOverlapping g =
                then rec seen is
                else do rest <- rec (S.insert b (S.insert a seen)) is
                        return $ ed : rest
-               
+
 type ExpanderMap n = M.Map (Node n) [Node n]
 
 coarsenGraph :: (Ord n, Ord e) => 
@@ -256,6 +256,7 @@ nodesInExpanderMap em =
 
 type Clusters n = M.Map (Node n) Int
 
+verbose x = return ()
 
 partition :: (Ord e, Ord n, Show e, Show n
              , PartitioningGoal pg) =>
@@ -265,18 +266,19 @@ partition g numClusters pg
     partitionSlow g numClusters pg
   | otherwise =
   do es <- randomSetOfEdgesNonOverlapping g
-     putStrLn "coarsening edges:"
-     mapM_ print $ M.toList es
+     verbose $ do putStrLn "coarsening edges:"
+                  mapM_ print $ M.toList es
      let (cg, exp) = coarsenGraph g es
-     putStrLn "coarse graph:"
-     printGraph cg
+     verbose $ do putStrLn "coarse graph:"
+                  printGraph cg
      checkGraph cg
      (cl, score1) <- partition cg numClusters pg
      let ecl = expandClustering exp cl
          en = V.fromList $ nodesInExpanderMap exp
      (recl, score2) <- localSearch g pg en numClusters (5*V.length en) ecl score1
-     putStrLn ("refinement improved score from " ++ show score1 
-               ++ " to " ++ show score2)
+     verbose $
+       putStrLn ("refinement improved score from " ++ show score1 
+                 ++ " to " ++ show score2)
      return (recl, score2)
   
 
@@ -406,11 +408,12 @@ partitionSlow g numClusters pg =
      let score0 = scoreAssignment pg g as
      print score0
      (nas, score1) <- localSearch g pg nodesVector numClusters (5*numNodes g) as score0
-     print score1
-     putStr "recalculated: "
-     let score2 = scoreAssignment pg g nas
-     print score2
-     return (nas, score2)
+     verbose $ do
+       let score2 = scoreAssignment pg g nas
+       print score1
+       putStr "recalculated: "
+       print score2
+     return (nas, score1)
   where nodesVector = V.fromList $ M.keys $ nodeWeight g
 
         
@@ -442,11 +445,12 @@ localSearch g pg nodesVector numClusters = recN
       do -- mapM_ (\(sc, as)-> print(i, n, as M.! n, sc)) options
          let cp a b = compareScores pg (fst a) (fst b)
              (bestSc, bestAs) = L.minimumBy cp options
-         when (compareScores pg sc1 bestSc == GT) $
-           putStrLn (show i ++ " improved "
-                     ++ show sc1 ++ " to " ++ show bestSc
-                     ++ " by assigning " ++ show (bestAs M.! n)
-                     ++ " to " ++ show n)
+         verbose $
+           when (compareScores pg sc1 bestSc == GT) $
+             putStrLn (show i ++ " improved "
+                       ++ show sc1 ++ " to " ++ show bestSc
+                       ++ " by assigning " ++ show (bestAs M.! n)
+                       ++ " to " ++ show n)
          rec (pred i) bestAs bestSc
 
 
@@ -575,10 +579,10 @@ showGraph g cl =
 {-
 
 setSeed 1002
-g <- randomGraphFromRectangles 1 14 14 0
---showGraph g Nothing
+g <- randomGraphFromRectangles 7 4 4 20
+showGraph g Nothing
 system "mv last.svg graph-1.svg"
-(cl, score) <- partition g 10 MinimalCuts
+(cl, score) <- partition g 6 MinimalCuts
 showGraph g (Just cl)
 
 -}
